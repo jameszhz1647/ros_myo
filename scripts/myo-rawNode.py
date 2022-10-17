@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from __future__ import print_function
 
@@ -176,7 +176,6 @@ class BT(object):
             ## not a response: must be an event
             self.handle_event(p)
 
-
 class MyoRaw(object):
     '''Implements the Myo-specific communication protocol.'''
 
@@ -202,7 +201,7 @@ class MyoRaw(object):
         return None
 
     def run(self, timeout=None):
-        self.bt.recv_packet(timeout)
+        return self.bt.recv_packet(timeout) 
 
     def connect(self):
         ## stop everything from before
@@ -239,6 +238,7 @@ class MyoRaw(object):
             ## don't know what these do; Myo Connect sends them, though we get data
             ## fine without them
             self.write_attr(0x19, b'\x01\x02\x00\x00')
+            # Subscribe for notifications from 4 EMG data channels
             self.write_attr(0x2f, b'\x01\x00')
             self.write_attr(0x2c, b'\x01\x00')
             self.write_attr(0x32, b'\x01\x00')
@@ -276,36 +276,55 @@ class MyoRaw(object):
             # self.write_attr(0x19, b'\x01\x03\x00\x01\x01')
             self.start_raw()
 
-        ## add data handlers
+        # add data handlers
         def handle_data(p):
-            if (p.cls, p.cmd) != (4, 5): return
+            if (p.cls, p.cmd) != (4, 5):
+                return
 
             c, attr, typ = unpack('BHB', p.payload[:4])
             pay = p.payload[5:]
 
             if attr == 0x27:
+                # Unpack a 17 byte array, first 16 are 8 unsigned shorts, last one an unsigned char
                 vals = unpack('8HB', pay)
-                ## not entirely sure what the last byte is, but it's a bitmask that
-                ## seems to indicate which sensors think they're being moved around or
-                ## something
+                # not entirely sure what the last byte is, but it's a bitmask that
+                # seems to indicate which sensors think they're being moved around or
+                # something
                 emg = vals[:8]
                 moving = vals[8]
                 self.on_emg(emg, moving)
+            # Read notification handles corresponding to the for EMG characteristics
+            elif attr == 0x2b or attr == 0x2e or attr == 0x31 or attr == 0x34:
+                '''According to http://developerblog.myo.com/myocraft-emg-in-the-bluetooth-protocol/
+                each characteristic sends two secuential readings in each update,
+                so the received payload is split in two samples. According to the
+                Myo BLE specification, the data type of the EMG samples is int8_t.
+                '''
+                emg1 = struct.unpack('<8b', pay[:8])
+                emg2 = struct.unpack('<8b', pay[8:])
+                self.on_emg(emg1, 0)
+                self.on_emg(emg2, 0)
+            # Read IMU characteristic handle
             elif attr == 0x1c:
                 vals = unpack('10h', pay)
                 quat = vals[:4]
                 acc = vals[4:7]
                 gyro = vals[7:10]
                 self.on_imu(quat, acc, gyro)
+            # Read classifier characteristic handle
             elif attr == 0x23:
-                typ, val, xdir = unpack('3B', pay)
+                typ, val, xdir, _, _, _ = unpack('6B', pay)
 
-                if typ == 1: # on arm
+                if typ == 1:  # on arm
                     self.on_arm(Arm(val), XDirection(xdir))
-                elif typ == 2: # removed from arm
+                elif typ == 2:  # removed from arm
                     self.on_arm(Arm.UNKNOWN, XDirection.UNKNOWN)
-                elif typ == 3: # pose
+                elif typ == 3:  # pose
                     self.on_pose(Pose(val))
+            # Read battery characteristic handle
+            elif attr == 0x11:
+                battery_level = ord(pay)
+                self.on_battery(battery_level)
             else:
                 print('data with unknown attr: %02X %s' % (attr, p))
 
@@ -326,12 +345,83 @@ class MyoRaw(object):
             self.bt.disconnect(self.conn)
 
     def start_raw(self):
+        ''' To get raw EMG signals, we subscribe to the four EMG notification
+        characteristics by writing a 0x0100 command to the corresponding handles.
+        '''
+        self.write_attr(0x2c, b'\x01\x00')  # Suscribe to EmgData0Characteristic
+        self.write_attr(0x2f, b'\x01\x00')  # Suscribe to EmgData1Characteristic
+        self.write_attr(0x32, b'\x01\x00')  # Suscribe to EmgData2Characteristic
+        self.write_attr(0x35, b'\x01\x00')  # Suscribe to EmgData3Characteristic
+
+        '''Bytes sent to handle 0x19 (command characteristic) have the following
+        format: [command, payload_size, EMG mode, IMU mode, classifier mode]
+        According to the Myo BLE specification, the commands are:
+            0x01 -> set EMG and IMU
+            0x03 -> 3 bytes of payload
+            0x02 -> send 50Hz filtered signals
+            0x01 -> send IMU data streams
+            0x01 -> send classifier events
+        '''
+        self.write_attr(0x19, b'\x01\x03\x02\x01\x01')
+
         '''Sending this sequence for v1.0 firmware seems to enable both raw data and
         pose notifications.
         '''
 
+        '''By writting a 0x0100 command to handle 0x28, some kind of "hidden" EMG
+        notification characteristic is activated. This characteristic is not
+        listed on the Myo services of the offical BLE specification from Thalmic
+        Labs. Also, in the second line where we tell the Myo to enable EMG and
+        IMU data streams and classifier events, the 0x01 command wich corresponds
+        to the EMG mode is not listed on the myohw_emg_mode_t struct of the Myo
+        BLE specification.
+        These two lines, besides enabling the IMU and the classifier, enable the
+        transmission of a stream of low-pass filtered EMG signals from the eight
+        sensor pods of the Myo armband (the "hidden" mode I mentioned above).
+        Instead of getting the raw EMG signals, we get rectified and smoothed
+        signals, a measure of the amplitude of the EMG (which is useful to have
+        a measure of muscle strength, but are not as useful as a truly raw signal).
+        '''
+
+        # self.write_attr(0x28, b'\x01\x00')  # Not needed for raw signals
+        # self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
+
+    def mc_start_collection(self):
+        '''Myo Connect sends this sequence (or a reordering) when starting data
+        collection for v1.0 firmware; this enables raw data but disables arm and
+        pose notifications.
+        '''
+
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x24, b'\x02\x00')  # Suscribe to classifier indications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier on
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x09\x01\x01\x00\x00')  # Set sleep mode, payload size = 1, never go to sleep, don't know, don't know
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x00\x01\x00')  # Set EMG and IMU, payload size = 3, EMG off, IMU on, classifier off
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier off
+
+    def mc_end_collection(self):
+        '''Myo Connect sends this sequence (or a reordering) when ending data collection
+        for v1.0 firmware; this reenables arm and pose notifications, but
+        doesn't disable raw data.
+        '''
+
         self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')
+        self.write_attr(0x1d, b'\x01\x00')
+        self.write_attr(0x24, b'\x02\x00')
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
+        self.write_attr(0x19, b'\x09\x01\x00\x00\x00')
+        self.write_attr(0x1d, b'\x01\x00')
+        self.write_attr(0x24, b'\x02\x00')
+        self.write_attr(0x19, b'\x01\x03\x00\x01\x01')
+        self.write_attr(0x28, b'\x01\x00')
+        self.write_attr(0x1d, b'\x01\x00')
+        self.write_attr(0x24, b'\x02\x00')
         self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
 
     def vibrate(self, length):
